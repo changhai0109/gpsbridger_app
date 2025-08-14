@@ -4,6 +4,7 @@
     <option name="MigrateToGradleLocalJavaHome">
       <set>
         <option value="/tank820/home/changhai/AndroidStudioProjects/MiniGPSBridger" />
+        <option value="$PROJECT_DIR$" />
       </set>
     </option>
   </component>

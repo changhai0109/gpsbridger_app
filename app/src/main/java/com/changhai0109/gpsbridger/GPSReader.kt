@@ -15,12 +15,18 @@ class GPSReader(private val context: Context, private val provider: NmeaProvider
     private val scope = CoroutineScope(Dispatchers.Default)
 
     private var lastUpdateTime = 0L
-    private val minInterval = 500L // 5 Hz updates
+    private val minInterval = 100L // 5 Hz updates
+
+    private var running = false
 
     private var lastLat = 0.0
     private var lastLon = 0.0
 
     init {
+        runLoop()
+    }
+
+    fun start() {
         try {
             lm.addTestProvider(
                 LocationManager.GPS_PROVIDER,
@@ -29,29 +35,67 @@ class GPSReader(private val context: Context, private val provider: NmeaProvider
                 Criteria.POWER_LOW,
                 Criteria.ACCURACY_FINE
             )
-        } catch (_: Exception) {}
+        } catch (_: Exception) {
+            return
+        }
         lm.setTestProviderEnabled(LocationManager.GPS_PROVIDER, true)
+        running = true
     }
 
-    fun start() {
-        scope.launch {
-            var lastDate = ""
-            for (line in provider.nmeaChannel) {
-                when {
-                    line.startsWith("\$GPRMC") -> {
-//                        Log.d("GPSReader", "RMC: $line")
-                        val date = parseRmcDate(line)
-                        if (date != null) lastDate = date
-                    }
-                    line.startsWith("\$GPGGA") -> {
-//                        Log.d("GPSReader", "GGA: $line")
-                        val locationData = parseGpgga(line, lastDate)
-                        if (locationData != null) {
-                            val (lat, lon, accuracy, timeMillis) = locationData
-                            updateMockLocation(lat, lon, accuracy, timeMillis)
-                        }
+    fun stop() {
+        running = false
+        scope.launch { provider.stop() }
+        try { lm.removeTestProvider(LocationManager.GPS_PROVIDER) } catch (_: Exception) {}
+    }
+
+    suspend fun run() {
+        var lastDate = ""
+        for (line in provider.nmeaChannel) {
+            Log.d("GPSReader", line)
+
+            when {
+                line.startsWith("\$GPRMC") -> {
+                    lastDate = parseRmcDate(line) ?: lastDate
+                    val (lat, lon, speed, course) = parseRmc(line)
+                    // Optionally update mock location from RMC if GGA missing
+                }
+                line.startsWith("\$GPGGA") -> {
+                    val locationData = parseGpgga(line, lastDate)
+                    if (locationData != null) {
+                        val (lat, lon, accuracy, timeMillis) = locationData
+                        updateMockLocation(lat, lon, accuracy, timeMillis)
                     }
                 }
+                line.startsWith("\$GPGSA") -> {
+                    val gsaData = parseGpgsa(line)
+                    Log.d("GPSReader", "GSA fix: $gsaData")
+                }
+                line.startsWith("\$GPGSV") -> {
+                    val satellites = parseGpgsv(line)
+                    Log.d("GPSReader", "Satellites: $satellites")
+                }
+                line.startsWith("\$GPGLL") -> {
+                    val gllData = parseGpgll(line)
+                    gllData?.let { (lat, lon, timeMillis) ->
+                        updateMockLocation(lat, lon, 5f, timeMillis)
+                    }
+                }
+                line.startsWith("\$GPVTG") -> {
+                    val (course, speedKts, speedKmh) = parseGpvtg(line)
+                    Log.d("GPSReader", "Course=$course, Speed=$speedKts kts/$speedKmh km/h")
+                }
+            }
+
+            if (!running) break
+        }
+    }
+
+    fun runLoop() {
+        scope.launch {
+            while (true) {
+                if (running)
+                    run()
+                delay(2000)
             }
         }
     }
@@ -60,26 +104,22 @@ class GPSReader(private val context: Context, private val provider: NmeaProvider
         scope.launch { provider.writeCommand(command) }
     }
 
-    fun close() {
-        scope.launch { provider.stop() }
-        try { lm.removeTestProvider(LocationManager.GPS_PROVIDER) } catch (_: Exception) {}
+    private fun parseRmc(nmea: String): RmcData {
+        val parts = nmea.split(",")
+        val lat = convertNmeaToDecimal(parts[3], parts[4])
+        val lon = convertNmeaToDecimal(parts[5], parts[6])
+        val speed = parts[7].toFloatOrNull() ?: 0f
+        val course = parts[8].toFloatOrNull() ?: 0f
+        return RmcData(lat, lon, speed, course)
     }
 
-    /** Parse $GPRMC to extract date (ddmmyy) */
-    private fun parseRmcDate(nmea: String): String? {
+    private fun parseGpgsa(nmea: String): GsaData {
         val parts = nmea.split(",")
-        return if (parts.size > 9) parts[9] else null
-    }
-
-    /** Parse $GPGGA to extract lat, lon, HDOP → accuracy, and UTC time */
-    private fun parseGpgga(nmea: String, dateStr: String): Quadruple<Double, Double, Float, Long>? {
-        val parts = nmea.split(",")
-        if (parts.size < 9) return null
-        val lat = convertNmeaToDecimal(parts[2], parts[3])
-        val lon = convertNmeaToDecimal(parts[4], parts[5])
-        val accuracy = parseHdopToAccuracy(parts[8])
-        val timeMillis = parseUtcTime(dateStr, parts[1])
-        return Quadruple(lat, lon, accuracy, timeMillis)
+        val fixType = parts[2]
+        val pdop = parts.getOrNull(15)?.toFloatOrNull() ?: 0f
+        val hdop = parts.getOrNull(16)?.toFloatOrNull() ?: 0f
+        val vdop = parts.getOrNull(17)?.toFloatOrNull() ?: 0f
+        return GsaData(fixType, pdop, hdop, vdop)
     }
 
     /** Update mock location smoothly in background */
@@ -128,16 +168,6 @@ class GPSReader(private val context: Context, private val provider: NmeaProvider
         return decimal
     }
 
-    /** Convert HDOP to rough accuracy in meters */
-    private fun parseHdopToAccuracy(hdopStr: String): Float {
-        return try {
-            val hdop = hdopStr.toFloat()
-            hdop * 5f
-        } catch (_: Exception) {
-            5f
-        }
-    }
-
     /** Convert UTC time + date to milliseconds */
     private fun parseUtcTime(dateStr: String, timeStr: String): Long {
         if (dateStr.length != 6 || timeStr.length < 6) return System.currentTimeMillis()
@@ -155,6 +185,42 @@ class GPSReader(private val context: Context, private val provider: NmeaProvider
         return cal.timeInMillis
     }
 
-    /** Helper to return four values (like Kotlin Pair/Triple) */
-    data class Quadruple<A, B, C, D>(val first: A, val second: B, val third: C, val fourth: D)
+    private fun parseGpgsv(nmea: String): List<Satellite> {
+        val parts = nmea.split(",")
+        val sats = mutableListOf<Satellite>()
+        var i = 4
+        while (i + 3 < parts.size) {
+            val prn = parts[i].toIntOrNull() ?: break
+            val elevation = parts[i+1].toIntOrNull() ?: 0
+            val azimuth = parts[i+2].toIntOrNull() ?: 0
+            val snr = parts[i+3].toIntOrNull() ?: 0
+            sats.add(Satellite(prn, elevation, azimuth, snr))
+            i += 4
+        }
+        return sats
+    }
+
+    private fun parseGpgll(nmea: String): GllData? {
+        val parts = nmea.split(",")
+        if (parts.size < 7) return null
+        val lat = convertNmeaToDecimal(parts[1], parts[2])
+        val lon = convertNmeaToDecimal(parts[3], parts[4])
+        val timeMillis = parseUtcTime("000000", parts[5])
+        return GllData(lat, lon, timeMillis)
+    }
+
+    private fun parseGpvtg(nmea: String): VtgData {
+        val parts = nmea.split(",")
+        val course = parts.getOrNull(1)?.toFloatOrNull() ?: 0f
+        val speedN = parts.getOrNull(5)?.toFloatOrNull() ?: 0f
+        val speedK = parts.getOrNull(7)?.toFloatOrNull() ?: 0f
+        return VtgData(course, speedN, speedK)
+    }
+
+    // --- Data classes ---
+    data class RmcData(val lat: Double, val lon: Double, val speed: Float, val course: Float)
+    data class GsaData(val fixType: String, val pdop: Float, val hdop: Float, val vdop: Float)
+    data class Satellite(val prn: Int, val elevation: Int, val azimuth: Int, val snr: Int)
+    data class GllData(val lat: Double, val lon: Double, val timeMillis: Long)
+    data class VtgData(val course: Float, val speedN: Float, val speedK: Float)
 }

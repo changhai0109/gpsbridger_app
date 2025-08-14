@@ -12,13 +12,15 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
 
 class GpsForegroundService : Service() {
-    private lateinit var nmeaProvider: TcpNmeaProvider
+//    private lateinit var nmeaProvider: TcpNmeaProvider
+    private lateinit var nmeaProvider: UsbNmeaProvider
     private lateinit var gpsReader: GPSReader
 
     override fun onCreate() {
         super.onCreate()
 
-        nmeaProvider = TcpNmeaProvider("z820.changhai0109.com", 5000)
+//        nmeaProvider = TcpNmeaProvider("z820.changhai0109.com", 5000)
+        nmeaProvider = UsbNmeaProvider(this)
         gpsReader = GPSReader(this, nmeaProvider)
 
         startForeground(1, createNotification("GPS Bridger running"))
@@ -53,7 +55,7 @@ class GpsForegroundService : Service() {
 
     override fun onDestroy() {
         super.onDestroy()
-        gpsReader.close()
+        gpsReader.stop()
         nmeaProvider.stop()
     }
 
