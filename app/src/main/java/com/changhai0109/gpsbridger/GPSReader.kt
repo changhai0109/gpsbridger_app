@@ -5,11 +5,12 @@ import android.content.Context
 import android.location.Criteria
 import android.location.Location
 import android.location.LocationManager
+import android.location.provider.ProviderProperties
 import android.os.SystemClock
 import kotlinx.coroutines.*
 import android.util.Log
 
-class GPSReader(private val context: Context, private val provider: NmeaProvider) {
+class GPSReader(private val context: Context) {
 
     private val lm = context.getSystemService(Context.LOCATION_SERVICE) as LocationManager
     private val scope = CoroutineScope(Dispatchers.Default)
@@ -22,6 +23,22 @@ class GPSReader(private val context: Context, private val provider: NmeaProvider
     private var lastLat = 0.0
     private var lastLon = 0.0
 
+    private val subscribers = mutableListOf<LocationSubscriber>()
+
+    fun subscribe(subscriber: LocationSubscriber) {
+        if (!subscribers.contains(subscriber))  subscribers.add(subscriber)
+    }
+
+    fun unsubscribe(subscriber: LocationSubscriber) {
+        subscribers.remove(subscriber)
+    }
+
+    private fun notifySubscribers(lat: Double, lon: Double, speed: Double) {
+        for (sub in subscribers) {
+            sub.onLocationUpdate(lat, lon, speed)
+        }
+    }
+
     init {
         runLoop()
     }
@@ -32,8 +49,8 @@ class GPSReader(private val context: Context, private val provider: NmeaProvider
                 LocationManager.GPS_PROVIDER,
                 false, false, false, false,
                 true, true, true,
-                Criteria.POWER_LOW,
-                Criteria.ACCURACY_FINE
+                ProviderProperties.POWER_USAGE_LOW,
+                ProviderProperties.ACCURACY_FINE
             )
         } catch (_: Exception) {
             return
@@ -44,13 +61,13 @@ class GPSReader(private val context: Context, private val provider: NmeaProvider
 
     fun stop() {
         running = false
-        scope.launch { provider.stop() }
+        scope.launch { LocationRepository.locationProvider.stop() }
         try { lm.removeTestProvider(LocationManager.GPS_PROVIDER) } catch (_: Exception) {}
     }
 
     suspend fun run() {
-        var lastDate = ""
-        for (line in provider.nmeaChannel) {
+        var lastDate = Long.MIN_VALUE
+        for (line in LocationRepository.locationProvider.nmeaChannel) {
             Log.d("GPSReader", line)
 
             when {
@@ -93,15 +110,19 @@ class GPSReader(private val context: Context, private val provider: NmeaProvider
     fun runLoop() {
         scope.launch {
             while (true) {
-                if (running)
-                    run()
+                try {
+                    if (running)
+                        run()
+                } catch (e: Exception) {
+                    Log.e("GPSReader", "fail running loop ${e.message}")
+                }
                 delay(2000)
             }
         }
     }
 
     fun sendCommand(command: String) {
-        scope.launch { provider.writeCommand(command) }
+        scope.launch { LocationRepository.locationProvider.writeCommand(command) }
     }
 
     private fun parseRmc(nmea: String): RmcData {
@@ -111,6 +132,39 @@ class GPSReader(private val context: Context, private val provider: NmeaProvider
         val speed = parts[7].toFloatOrNull() ?: 0f
         val course = parts[8].toFloatOrNull() ?: 0f
         return RmcData(lat, lon, speed, course)
+    }
+
+    fun parseRmcDate(line: String): Long? {
+        // Example: $GPRMC,123519,A,4807.038,N,01131.000,E,...
+        val parts = line.split(",")
+        if (parts.size < 10) return null
+
+        val dateStr = parts[9] // DDMMYY
+        val timeStr = parts[1] // HHMMSS.sss
+
+        return try {
+            val sdf = java.text.SimpleDateFormat("ddMMyyHHmmss", java.util.Locale.US)
+            sdf.timeZone = java.util.TimeZone.getTimeZone("UTC")
+            val date = sdf.parse(dateStr + timeStr.substring(0, 6))
+            date?.time
+        } catch (e: Exception) {
+            null
+        }
+    }
+
+    fun parseGpgga(line: String, lastDate: Long?): GgaData? {
+        // Returns lat, lon, accuracy, timestamp
+        val parts = line.split(",")
+        if (parts.size < 10) return null
+
+        val lat = convertNmeaToDecimal(parts[2], parts[3])
+        val lon = convertNmeaToDecimal(parts[4], parts[5])
+        val hdop = parts[8].toFloatOrNull() ?: 1f
+
+        val accuracy = hdop * 5f // rough estimate
+        val timeMillis = lastDate ?: System.currentTimeMillis()
+
+        return GgaData(lat, lon, accuracy, timeMillis)
     }
 
     private fun parseGpgsa(nmea: String): GsaData {
@@ -140,8 +194,14 @@ class GPSReader(private val context: Context, private val provider: NmeaProvider
         }
         lastLat = lat
         lastLon = lon
+        LocationRepository.lat = mockLocation.latitude
+        LocationRepository.lon = mockLocation.longitude
+        LocationRepository.speed = mockLocation.speed.toDouble()
+        this.notifySubscribers(mockLocation.latitude, mockLocation.longitude, mockLocation.speed.toDouble())
 
-        scope.launch { lm.setTestProviderLocation(LocationManager.GPS_PROVIDER, mockLocation) }
+        scope.launch {
+            lm.setTestProviderLocation(LocationManager.GPS_PROVIDER, mockLocation)
+        }
     }
 
     private fun distance(lat1: Double, lon1: Double, lat2: Double, lon2: Double): Double {
@@ -223,4 +283,5 @@ class GPSReader(private val context: Context, private val provider: NmeaProvider
     data class Satellite(val prn: Int, val elevation: Int, val azimuth: Int, val snr: Int)
     data class GllData(val lat: Double, val lon: Double, val timeMillis: Long)
     data class VtgData(val course: Float, val speedN: Float, val speedK: Float)
+    data class GgaData(val lat: Double, val lon: Double, val accuracy: Float, val timestamp: Long)
 }

@@ -6,28 +6,36 @@ import android.app.Service
 import android.content.Intent
 import android.os.Build
 import android.os.IBinder
+import android.os.Binder
 import androidx.core.app.NotificationCompat
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
 
 class GpsForegroundService : Service() {
-//    private lateinit var nmeaProvider: TcpNmeaProvider
-    private lateinit var nmeaProvider: UsbNmeaProvider
     private lateinit var gpsReader: GPSReader
+    private val binder = LocalBinder()
+
+    inner class LocalBinder : Binder() {
+        fun getGpsReader(): GPSReader = gpsReader
+    }
+
+    override fun onBind(intent: Intent): IBinder {
+        return binder
+    }
 
     override fun onCreate() {
         super.onCreate()
 
 //        nmeaProvider = TcpNmeaProvider("z820.changhai0109.com", 5000)
-        nmeaProvider = UsbNmeaProvider(this)
-        gpsReader = GPSReader(this, nmeaProvider)
+        LocationRepository.locationProvider = UsbNmeaProvider(this)
+        gpsReader = GPSReader(this)
 
         startForeground(1, createNotification("GPS Bridger running"))
 
         // Launch coroutine to start provider then GPSReader with a delay
         CoroutineScope(Dispatchers.IO).launch {
-            nmeaProvider.start()
+            LocationRepository.locationProvider.start()
             // Wait a short time (e.g., 500ms to 1s) for connection to establish
             kotlinx.coroutines.delay(1000)
             gpsReader.start()
@@ -54,10 +62,8 @@ class GpsForegroundService : Service() {
     }
 
     override fun onDestroy() {
-        super.onDestroy()
         gpsReader.stop()
-        nmeaProvider.stop()
+        LocationRepository.locationProvider.stop()
+        super.onDestroy()
     }
-
-    override fun onBind(intent: Intent?): IBinder? = null
 }
